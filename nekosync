@@ -37,7 +37,7 @@ require 5.008008;
 
 use strict;
 
-use constant VERSION => "1.2r24";
+use constant VERSION => "1.2r25";
 use constant TRUE => 1;
 use constant FALSE => 0;
 
@@ -116,8 +116,8 @@ sub syncdist( $$$ );
 sub main();
 
 
-my $site = 'http://https://github.com/srcshelton/nekosync';
-my $update = "blob/master/history/$name.history";
+my $site = 'http://raw.githubusercontent.com/srcshelton/nekosync';
+my $update = "master/history/$name.history";
 
 ## Variables below here can be over-ridden in the config file
 
