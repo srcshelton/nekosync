@@ -46,12 +46,38 @@ my $delete = FALSE;
 
 my $launchswmgr = TRUE;
 
-my $configured = undef;
-
 ## Do not edit below this line
+
+my $configured = undef;
 
 my $width = ( ( $ENV{ COLUMNS } or 80 ) - 2 );
 $width = 40 if $width < 40;
+
+## Utility subroutines
+
+sub ifverbose( $;$ ) {
+	my ( $true, $false ) = @_;
+
+	my $message = $verbose ? $true : $false;
+
+	return undef if not $message;
+
+	open ( my $OUT, ">&", STDOUT ) or die "FATAL:  Cannot dup STDOUT: $!\n";
+	if( $message =~ m/^\S+:\s/sm ) {
+		open ( my $OUT, ">&", STDERR ) or die "FATAL:  Cannot dup STDERR: $!\n";
+	}
+	return print $OUT $message;
+} # ifverbose
+
+sub ifnotverbose( $ ) {
+	return ifverbose( undef, shift );
+} # ifnotverbose
+
+sub ifdebug( $ ) {
+	return undef if not $debug;
+
+	return print STDERR shift;
+} # ifdebug
 
 #
 # Scary wrapper around open to redirect STDERR away from the console
@@ -62,8 +88,8 @@ sub qopen( *;$$ ) {
 	$_[0] = gensym() unless( defined $_[0] );
 	my $file = qualify_to_ref( shift, caller() );
 
-	open( my $STDERR_SAVE, ">&", STDERR ) or die "FATAL:  Cannot dup STDERR";
-	open( STDERR, ">/dev/null" ) or die "FATAL:  Cannot reopen /dev/null";
+	open( my $STDERR_SAVE, ">&", STDERR ) or die "FATAL:  Cannot dup STDERR: $!\n";
+	open( STDERR, ">/dev/null" ) or die "FATAL:  Cannot open /dev/null: $!\n";
 
 	my ( $return, $bang);
 	eval {
@@ -77,7 +103,7 @@ sub qopen( *;$$ ) {
 
 	open( STDERR, ">&", $STDERR_SAVE );
 
-	die $@ if $@;
+	die "$@\n" if $@;
 
 	$! = $bang;
 	return $return;
@@ -92,7 +118,7 @@ sub readconfig( $ ) {
 	my $File;
 
 	if( not open( $File, "<", $filename ) ) {
-		print STDERR "WARN:   Cannot read from file \"$filename\": $!\n" if $verbose;
+		ifverbose( "WARN:   Cannot read from file \"$filename\": $!\n" );
 	} else {
 		if( wantarray ) {
 			local $/ = "";
@@ -122,11 +148,13 @@ if( $extconf ) {
 
 die "nekosync has not yet been configured - please\n  edit $extconf\n  and ensure sane defaults are set before\n  re-running\n" if( defined $configured );
 
-die "FATAL:  Cannot find tar executable at $tar" if not -x $tar;
-die "FATAL:  Cannot find tar executable at $get" if not -x $get;
-die "FATAL:  Cannot find tar executable at $rsync" if not -x $rsync and not $useget;
+die "FATAL:  Cannot find tar executable at $tar\n" if not -x $tar;
+die "FATAL:  Cannot find tar executable at $get\n" if not -x $get;
+die "FATAL:  Cannot find tar executable at $rsync\n" if not -x $rsync and not $useget;
 
 $rsyncargs = join( ' ', $rsyncdefargs, $rsyncargs );
+
+$width = undef if $debug;
 
 sub safemkdir( $ );
 sub safemkdir( $ ) {
@@ -180,65 +208,32 @@ sub setupdirs( $$$ ) {
 	return TRUE;
 } # setupdirs
 
-sub removeoldfiles( $$$\@\@ ) {
-	my ( $dloc, $oloc, $delete, $oldpackages, $oldfiles ) = @_;
+sub removeoldfiles( $$$\@ ) {
+	my ( $dloc, $oloc, $delete, $oldpackages ) = @_;
 
 	my $counter = 0;
 	my $deleted = FALSE;
-
-	if( scalar( @$oldfiles ) and not $safe ) {
-		$deleted = TRUE;
-		print STDOUT "Removing obsolete files       " if not $verbose;
-		while( my $file = pop @$oldfiles ) {
-			if( -d $file ) {
-				if( $verbose ) {
-					print STDOUT "\"$file\" is a directory!\n";
-				} else {
-					print STDOUT "!";
-					$counter++ if defined $width;
-				}
-			} else {
-				unlink( $file ) or die "FATAL:  Error unlinking \"$file\": $!\n" if not $pretend;
-				if( $verbose ) {
-					print STDOUT "\"$file\" removed\n";
-				} else {
-					print STDOUT ".";
-					$counter++ if defined $width;
-				}
-			}
-			if( defined $width && not $verbose ) {
-				if( ( $counter + 30 ) > $width ) {
-					$counter = 0;
-					print STDOUT "\n" . " " x 30;
-				}
-			}
-		}
-	}
 
 	if( $oloc or $delete ) {
 		if( scalar( @$oldpackages ) and not $safe ) {
 
 			if( $deleted ) {
 				if( not $delete ) {
-					print STDOUT "\nMoving obsolete files         " if not $verbose;
+					ifnotverbose( "\nMoving obsolete files         " );
 					$counter = 0;
 				}
 			} else {
 				if( $delete ) {
-					print STDOUT "Removing obsolete files       " if not $verbose;
+					ifnotverbose( "Removing obsolete files       " );
 				} else {
-					print STDOUT "Moving obsolete files         " if not $verbose;
+					ifnotverbose( "Moving obsolete files         " );
 				}
 			}
 
 			while( my $file = pop @$oldpackages ) {
 				if( -d $file ) {
-					if( $verbose ) {
-						print STDOUT "\"$file\" is a directory!\n";
-					} else {
-						print STDOUT "!";
-						$counter++ if defined $width;
-					}
+					ifverbose( "\"$file\" is a directory!\n", "!" );
+					$counter++ if defined $width;
 				} else {
 					if( $delete ) {
 						unlink( $file ) or die "FATAL:  Error unlinking \"$file\": $!\n" if not $pretend;
@@ -246,18 +241,10 @@ sub removeoldfiles( $$$\@\@ ) {
 						my $dest = "$dloc";
 						$dest .= "/$oloc" if $oloc;
 						#rename( $file, "$dest/" ) or die "FATAL:  Error moving $file - $!\n" if not $pretend;
-						eval { system( "mv \"$file\" \"$dest/\"" ) or die "FATAL:  Error moving $file - $!\n" } if not $pretend;
+						eval { system( "mv -f \"$file\" \"$dest/\"" ) == 0 or die "FATAL:  Error moving $file - $!\n" } if not $pretend;
 					}
-					if( $verbose ) {
-						if( $delete ) {
-							print STDOUT "\"$file\" removed\n";
-						} else {
-							print STDOUT "\"$file\" moved\n";
-						}
-					} else {
-						print STDOUT ".";
-						$counter++ if defined $width;
-					}
+					ifverbose( "\"$file\" " . $delete ? "removed\n" : "moved\n", "." );
+					$counter++ if defined $width;
 				}
 				if( defined $width && not $verbose ) {
 					if( ( $counter + 30 ) > $width ) {
@@ -266,18 +253,18 @@ sub removeoldfiles( $$$\@\@ ) {
 					}
 				}
 			}
-			print STDOUT "\n" if not $verbose;
+			ifnotverbose( "\n" );
 		}
 	}
 
 	return TRUE;
-} # removeoldfiles()
+} # removeoldfiles
 
-sub findorphanfiles( $\%\@ ) {
-	my ( $iloc, $instfiles, $deletions ) = @_;
+sub findorphanfiles( $\% ) {
+	my ( $iloc, $instfiles ) = @_;
+	my @deletions;
 
-	print STDOUT "Checking for orphaned files   " if not $verbose;
-
+	ifnotverbose( "Checking for orphaned files   " );
 	opendir( my $Inst, $iloc ) or die "FATAL:  Cannot opendir on \"$iloc\": $!\n";
 
 	my $counter = 0;
@@ -286,13 +273,9 @@ sub findorphanfiles( $\%\@ ) {
 		next if -d "$iloc/$file";
 		next if $file =~ /^.(.)?$/;
 		if( not exists $instfiles -> { $file } ) {
-			push( @$deletions, "$iloc/$file" );
-			if( $verbose ) {
-				print STDOUT $file . " doesn't belong to any current package\n";
-			} else {
-				print STDOUT "-";
-				$counter++ if defined $width;
-			}
+			push( @deletions, "$iloc/$file" );
+			ifverbose( $file . " doesn't belong to any current package\n", "-" );
+			$counter++ if defined $width;
 		}
 		if( defined $width && not $verbose ) {
 			if( ( $counter + 30 ) > $width ) {
@@ -302,65 +285,72 @@ sub findorphanfiles( $\%\@ ) {
 		}
 	}
 	closedir( $Inst );
+	ifnotverbose( "\n" );
 
-	print STDOUT "\n" if not $verbose;
-
+	removeoldfiles( $iloc, undef, TRUE, @deletions );
 	return TRUE;
 } # findorphanfiles
 
-sub unpackfiles( \@$$$\@ ) {
-	my ( $files, $dloc, $iloc, $oloc, $oldpackages ) = @_;
-	
-	my @oldfiles;
+sub unpackfiles( \@$$$ ) {
+	my ( $files, $dloc, $iloc, $oloc ) = @_;
 	my %instfiles;
+	my %errors;
 	my %messages;
 
-	print STDOUT "Unpacking updated files       " if not $verbose;
+	ifnotverbose( "Unpacking updated files       " );
+	ifdebug( "\n" );
 	my $counter = 0;
 	foreach my $file ( sort( @$files ) ) {
 		my $replace = FALSE;
-		print STDOUT "Processing " . $file . "\n" if $verbose;
+		ifverbose( "Processing " . $file . "\n" );
 		my $command = join( ' ', $tar, '-tvf', "$dloc/$file" , "|" );
-		open( my $File, $command ) or die "FATAL:  Cannot open pipe to $tar: $!";
+		qopen( my $File, $command ) or die "FATAL:  Cannot open pipe to $tar: $!\n";
 		while( <$File> ) {
 			my @fields = split( /[[:space:]]+/ );
 			if( scalar( @fields ) and $fields[ 0 ] =~ /^-/ ) {
 				( my $filename = $fields[ 5 ] ) =~ s#^\./##;
 				my $size = $fields[ 2 ];
 				if( defined $instfiles{ $filename } ) {
-					$messages{ $file } = "$file clashes with files from another package";
+					my ( $name ) = ( $file =~ m/^(.*)\.tardist$/ );
+					$messages{ $file } = "$name clashes with files from another package";
 				}
 				$instfiles{ $filename } = $size;
 				if( scalar( my $result = stat( "$iloc/$filename" ) ) ) {
 					my $fsize = $result -> size;
 					if( not ( $size eq $fsize ) ) {
 						$replace = TRUE;
-						print STDERR "Debug:  $iloc/$filename from $file has changed from $size to $fsize\n" if $debug;
+						my ( $name ) = ( $file =~ m/^(.*)\.tardist$/ );
+						ifdebug( "Debug: $iloc/$filename from $name has changed from $size to $fsize\n" );
 					}
 				} else {
 					$replace = TRUE;
-					print STDERR "Debug:  stat() failed on $iloc/$filename\n" if $debug;
+					ifdebug( "Debug: stat() failed on $iloc/$filename\n" );
 				}
 			} else {
 				$replace = TRUE;
-				print STDERR "Debug:  Unknown format returned from $tar: \"@fields\"\n" if $debug;
+				ifdebug( "Debug: Unknown format returned from $tar: \"@fields\"\n" );
 			}
 		}
-		if( $replace ) {
-			my $command = join( ' ', $tar, '-xf', "$dloc/$file", '-C', $iloc );
-			if( $verbose ) {
-				print STDOUT "Unpacking $file\n";
-			} else {
-				print STDOUT "+";
-				$counter++;
-			}
-			eval { system( $command ) } if not $pretend;
-			die "\nFATAL:  Unable to unpack $file: $@\n" if $@;
+		if( $@ ) {
+			ifverbose( "WARN: Archive listing failed: $@\n", $debug ? "" : "!" );
+			$counter++;
 		} else {
-			if( $verbose ) {
-				print "Data from $file unchanged\n";
+			if( $replace ) {
+				my $command = join( ' ', $tar, '-xf', "$dloc/$file", '-C', $iloc, '>/dev/null 2>&1' );
+				if( not $pretend ) {
+					ifverbose( "Unpacking $file\n" );
+					eval { system( $command ) };
+					if( $@ or $? ) {
+						$errors{ $file } = "$file is corrupt and cannot be unpacked";
+						ifverbose( "\nERROR: Unable to unpack $file: $@ ($?)\n", $debug ? "" : "!" );
+						$counter++;
+					} else {
+						ifverbose( "Unpacked $file successfully\n", $debug ? "" : "+" );
+						$counter++;
+					}
+				}
 			} else {
-				print STDOUT ".";
+				ifverbose( "Data from $file unchanged\n", $debug ? "" : "." );
 				$counter++;
 			}
 		}
@@ -375,92 +365,95 @@ sub unpackfiles( \@$$$\@ ) {
 	print STDOUT "\n";
 	print STDERR "\n" if( %messages );
 	foreach my $message ( sort( values( %messages ) ) ) {
-		print STDERR "QA Warning: $message\n";
+		print STDERR "Warning: $message\n";
 	}
 	print STDERR "\n" if( %messages );
+	print STDERR "\n" if( %errors and not %messages );
+	foreach my $message ( sort( values( %errors ) ) ) {
+		print STDERR "Error: $message\n";
+	}
+	print STDERR "\n" if( %errors );
 
-	findorphanfiles( $iloc, %instfiles, @oldfiles );
-	removeoldfiles( $dloc, $oloc, $delete, @$oldpackages, @oldfiles );
-
+	findorphanfiles( $iloc, %instfiles );
 	return TRUE;
 } # unpackfiles
 
 sub getdist( $$$$ ) {
 	my ( $dloc, $iloc, $oloc, $delete ) = @_;
-
 	my $Index;
 	my %md5sums;
 	my @downloads;
 	my @oldpackages;
 	my $counter = 0;
+	my $checksum;
 
 	autoflush STDOUT TRUE;
-
 	setupdirs( $dloc, $iloc, $oloc );
-
 	chdir $dloc or die "FATAL:  Cannot chdir to \"$dloc\"\n";
+	ifverbose( "Downloading $index from $mirror/ - please wait...", "Downloading index file, please wait..." );
+	ifdebug( "\n" );
 
-	if( $verbose ) {
-		print STDOUT "Downloading $index from $mirror/ - please wait... ";
-	} else {
-		print STDOUT "Downloading index file, please wait...";
-	}
-
-	my $command = join( ' ', $get, $getargs, '-', $mirror . "/" . $index , "|" );
-	qopen( my $File, $command ) or die "FATAL:  Cannot open pipe to $get: $!";
-	while( <$File> ) {
-		my @fields = split( /[[:space:]]+/ );
-		if( scalar( @fields ) ) {
-			my $filename = $fields[ 0 ];
-			my $line = join( ' ', @fields );
-			(my $sum = $line ) =~ s/^.*[[:space:]]([[:alnum:]]{32})[[:space:]].*$/$1/;
-			if( $sum ) {
-				$md5sums{ $filename } = $sum;
-				print STDERR "Debug:  Found sum $sum for file $filename\n" if $debug;
+	{
+		my $contents = undef;
+		my $command = join( ' ', $get, $getargs, '-', $mirror . "/" . $index , "|" );
+		qopen( my $File, $command ) or die "FATAL:  Cannot open pipe to $get: $!\n";
+		while( <$File> ) {
+			my @fields = split( /[[:space:]]+/ );
+			if( scalar( @fields ) ) {
+				my $filename = $fields[ 0 ];
+				my $line = join( ' ', @fields );
+				( my $sum = $line ) =~ s/^.*[[:space:]]([[:alnum:]]{32})[[:space:]].*$/$1/;
+				if( $sum ) {
+					$md5sums{ $filename } = $sum;
+					ifdebug( "\nFound sum $sum for file $filename" );
+				}
+				$contents .= $line;
 			}
 		}
-	}
-	close( $File );
+		close( $File );
 
-	print STDOUT " done\n" if not $verbose;
+		if( not %md5sums ) {
+			die "\nFATAL: Specified directory $mirror/ is empty\n";
+		}
+
+		if( defined $contents ) {
+			ifdebug( "\nGenerating MD5 sum of $index... " );
+			my $digest = Digest::MD5 -> new();
+			$digest -> add( $contents );
+			$checksum = $digest -> hexdigest();
+			$digest = undef;
+			ifdebug( $checksum . "\n" );
+		}
+	}
 
 	foreach my $file ( sort( keys( %md5sums ) ) ) {
 		if( $file !~ /\.tardist$/ ) {
 			delete $md5sums{ $file };
 		}
 	}
-	print STDOUT "read " . keys( %md5sums ) . " packages\n" if $verbose;
-
-	print STDOUT "\nChecking for updated packages " if not $verbose;
+	ifverbose( " read " . keys( %md5sums ) . " packages\n", ( $debug ? "" : " done" ) . "\nChecking for updated packages " );
+	ifdebug( "\n" );
 
 	foreach my $file ( sort( keys( %md5sums ) ) ) {
-		print STDOUT "Debug:  Looking for " . $file . "\n" if $debug;
+		ifdebug( "Looking for " . $file . "\n" );
 		if( -r $file ) {
 			open( my $File, "<", $file ) or die "FATAL:  Cannot open " . $file . ": $!\n";
 			my $digest = Digest::MD5 -> new();
 			$digest -> addfile( $File );
 			my $sum = $digest -> hexdigest();
+			$digest = undef;
 			if( $sum eq $md5sums{ $file } ) {
-				if( $verbose ) {
-					print STDOUT $file . " is up to date\n";
-				} else {
-					print STDOUT "." if not $verbose;
-					$counter++ if defined $width && not $verbose;
-				}
+				ifverbose( $file . " is up to date\n", $debug ? undef : "." );
+				$counter++ if defined $width;
 			} else {
-				print STDOUT $file . ": Digest $sum does not match archive digest " . $md5sums{ $file } . "\n" if $verbose;
+				ifverbose( $file . ": Digest $sum does not match archive digest " . $md5sums{ $file } . "\n", "*" );
 				push( @downloads, $file );
-				print STDOUT "*" if not $verbose;
-				$counter++ if defined $width && not $verbose;
+				$counter++ if defined $width;
 			}
 		} else {
 			push( @downloads, $file );
-			if( $verbose ) {
-				print STDOUT $file . ": Does not exist on local filesystem\n";
-			} else {
-				print STDOUT "+" if not $verbose;
-				$counter++ if defined $width && not $verbose;
-			}
+			ifverbose( $file . ": Does not exist on local filesystem\n", "+" );
+			$counter++ if defined $width;
 		}
 		if( defined $width && not $verbose ) {
 			if( ( $counter + 30 ) > $width ) {
@@ -478,12 +471,8 @@ sub getdist( $$$$ ) {
 			next if $file !~ /\.tardist$/;
 			if( not( defined $md5sums{ $file } ) ) {
 				push( @oldpackages, "$dloc/$file" );
-				if( $verbose ) {
-					print STDOUT $file . ": Removed from remote archive\n";
-				} else {
-					print STDOUT "-";
-					$counter++ if defined $width;
-				}
+				ifverbose( $file . ": Removed from remote archive\n", "-" );
+				$counter++ if defined $width;
 			}
 			if( defined $width && not $verbose ) {
 				if( ( $counter + 30 ) > $width ) {
@@ -494,16 +483,14 @@ sub getdist( $$$$ ) {
 		}
 		closedir( $Dist );
 	}
-
-	print STDOUT "\n" if not $verbose;
-
+	ifnotverbose( "\n" );
 	print STDOUT "\n" . scalar( @oldpackages) . " files are obsolete and " . scalar( @downloads ) . " files have been modified\n\n";
 
 	while( my $file = pop @downloads ) {
 		my $command = join( ' ', $get, $getargs, '-', $mirror . "/" . $file, "|" );
-		printf STDOUT "Downloading  $file  ";
+		print STDOUT "Downloading  $file  ";
 		qopen( my $InFile, $command ) or die "FATAL:  Cannot open pipe to $get: $!\n";
-		open( my $OutFile, ">", $dloc . "/" . $file ) or die "FATAL:  Cannot open $file for writing: $!";
+		open( my $OutFile, ">", $dloc . "/" . $file ) or die "FATAL:  Cannot open $file for writing: $!\n";
 		my $counter = 0;
 		my $iteration = 0;
 		my @characters = ( '/', '-', '\\', '|' );
@@ -514,38 +501,59 @@ sub getdist( $$$$ ) {
 			print $OutFile $data;
 		}
 		close( $OutFile );
-		close( $InFile );
-		printf STDOUT "\bdone\n";
+		if( close( $InFile ) ) {
+			print STDOUT "\bdone\n";
+		} else {
+			ifnotverbose( "\b\n" );
+			print STDERR "Fetch error: $? - Bad descript.ion?\n";
+		}
+	}
+
+	ifdebug( "\nGenerating second MD5 sum of $index..." );
+	{
+		my $contents = undef;
+		my $command = join( ' ', $get, $getargs, '-', $mirror . "/" . $index , "|" );
+		qopen( my $File, $command ) or die "FATAL:  Cannot open pipe to $get: $!\n";
+		while( <$File> ) {
+			my @fields = split( /[[:space:]]+/ );
+			if( scalar( @fields ) ) {
+				my $line = join( ' ', @fields );
+				$contents .= $line;
+			}
+		}
+		close( $File );
+
+		if( defined $checksum ) {
+			my $digest = Digest::MD5 -> new();
+			$digest -> add( $contents );
+			if( $checksum ne $digest -> hexdigest() ) {
+				die "FATAL: $index changed during operation - please try again...\n"
+			}
+			$digest = undef;
+			ifdebug( " checksums match\n\n" );
+		} else {
+			print STDERR "ERROR: Cannot generate checksums - was a valid index downloaded?\n";
+		}
 	}
 
 	my @files = keys( %md5sums );
-	unpackfiles( @files, $dloc, $iloc, $oloc, @oldpackages );
-
+	unpackfiles( @files, $dloc, $iloc, $oloc );
+	removeoldfiles( $dloc, $oloc, $delete, @oldpackages );
 	return TRUE;
 } # getdist
 
 sub syncdist( $$$ ) {
 	my ( $dloc, $iloc, $oloc ) = @_;
+	my @tardists;
+	my $counter = 0;
 
 	autoflush STDOUT TRUE;
-
 	setupdirs( $dloc, $iloc, $oloc );
-
 	chdir $dloc or die "FATAL:  Cannot chdir to \"$dloc\"\n";
-
-	if( $verbose ) {
-		print STDOUT "Starting rsync connection to $rmirror - please wait... \n";
-	} else {
-		print STDOUT "Starting rsync, please wait...\n";
-	}
-
+	ifverbose( "Starting rsync connection to $rmirror - please wait... \n", "Starting rsync, please wait...\n" );
 	my $command = join( ' ', $rsync, $rsyncargs, "--backup-dir '$distloc/$oldloc'", $rmirror , "$distloc" );
-	print STDOUT "Executing $command\n" if $verbose;
-	system( $command ) == 0 or die "rsync failed: $?";
-
-	my @tardists;
-	my @oldpackages;
-	my $counter = 0;
+	ifverbose( "Executing $command\n" );
+	system( $command ) == 0 or die "rsync failed: $?\n";
 
 	print STDOUT "\n";
 	print STDOUT "Reading directory contents    ";
@@ -557,7 +565,7 @@ sub syncdist( $$$ ) {
 			next if -d $file;
 			next if $file !~ /\.tardist$/;
 			push( @tardists, "$file" );
-			print STDOUT "." if not $verbose;
+			ifnotverbose( "." );
 			$counter++ if defined $width;
 			if( defined $width && not $verbose ) {
 				if( ( $counter + 30 ) > $width ) {
@@ -568,11 +576,9 @@ sub syncdist( $$$ ) {
 		}
 		closedir( $Dist );
 	}
-
 	print STDOUT "\n";
 
-	unpackfiles( @tardists, $dloc, $iloc, $oloc, @oldpackages );
-
+	unpackfiles( @tardists, $dloc, $iloc, $oloc );
 	return TRUE;
 } # syncdist
 
@@ -583,9 +589,6 @@ if( $useget ) {
 		print STDOUT "\n";
 		$mirror =~ s#/current$#/beta#;
 		getdist( "$distloc/beta", "$instloc/beta", undef, TRUE );
-
-		#$mirror =~ s#/nekoware/beta$#/contrib/foetz#i;
-		#getdist( "$distloc/foetz", "$instloc/foetz", undef, TRUE );
 	}
 } else {
 	syncdist( $distloc, $instloc, $oldloc );
@@ -597,7 +600,6 @@ if( $launchswmgr ) {
 }
 
 print STDOUT "\n$name finished at " . gmtime() . "\n";
-
 exit 0;
 
 # vi: set nowrap ts=4:
