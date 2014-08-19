@@ -1,0 +1,1712 @@
+#!/bin/sh
+if test -n "`perl -V | grep "5\.0"`"
+then
+	echo -n "FATAL: You appear to have perl "
+	for WORD in `perl -v | grep "^This is "`
+	do  
+		echo $WORD
+	done | grep "5" | xargs echo -n
+	echo ", but version 5.8 is required."
+	exit 1
+fi
+exec perl -wx $0 "$@"
+	if 0;
+#!perl -w
+#line 16
+
+package nekosync;
+
+###############################################################################
+#
+# nekosync - based on tardist2inst, with added MD5 checking...
+#
+###############################################################################
+#
+# Version:		1.2
+# Last updated:	03/06/2008	Stuart Shelton [SRCS]
+#
+# Changes:
+# 1.2			Add command-line support
+# 				Add support for unlimited $extra locations
+# 1.1			Add rsync support
+# 				Code cleanup
+# 1.0			Initial release
+#
+
+require 5.008008;
+
+use strict;
+
+use constant VERSION => "1.2r24";
+use constant TRUE => 1;
+use constant FALSE => 0;
+
+my $name = 'nekosync';
+
+#
+# Note that, unfortunately, there is no support for the version of Perl packaged
+# with IRIX.
+#
+# Even via CPAN, the Digest::MD5 module cannot be built because the native Perl
+# is deemed too old - and since that is vital to this code's operation, I've
+# not even attempted to build the other necessary modules (notably List::Util,
+# which is only actually used once, and so is an ideal candidate for inlining)
+# required to run.
+#
+
+use File::stat;
+use Getopt::Long;
+use IO::Handle;
+use IO::Socket;
+#use List::Util qw( max );
+
+eval "use List::Util qw( max );";
+if( $@ ) {
+	warn "I can't find the List::Util Perl module on this system, which is "
+	   . "required for\n";
+	warn "$name to run correctly.\n";
+	warn "Please install this module via your favourite package-management "
+	   . "system,\n";
+	warn "manually from a nekoware mirror, or via CPAN.\n\n";
+	warn "This can be achieved by running:\n\n\tperl -w -MCPAN -eshell\n\n";
+	warn "... and then typing:\n\n\tinstall List::Util\n\n";
+	die "Please re-run $0 once List::Util is installed.\n";
+}
+
+my $usemd5sum = FALSE;
+
+eval "use Digest::MD5;";
+if( $@ ) {
+	warn "I can't find the Digest::MD5 Perl module on this system, which is "
+	   . "required for\n";
+	warn "$name to run correctly.\n";
+	warn "Please install this module via your favourite package-management "
+	   . "system,\n";
+	warn "manually from a nekoware mirror, or via CPAN.\n\n";
+	warn "This can be achieved by running:\n\n\tperl -w -MCPAN -eshell\n\n";
+	warn "... and then typing:\n\n\tinstall Digest::MD5\n\n";
+	die "Please re-run $0 once Digest::MD5 is installed.\n";
+#	warn "Will attempt to fall back to \"md5sum\" binary...\n\n";
+	$usemd5sum = TRUE;
+}
+
+use Symbol qw( qualify_to_ref gensym );
+
+
+#
+## Forward declarations - helps to find things ;)
+#
+sub ifverbose( $;$ );
+sub ifnotverbose( $ );
+sub ifdebug( $;$ );
+sub ifnotdebug( $ );
+sub httphead( $$\% );
+sub getheader( $$ );
+sub qopen( *;$$ );
+sub readconfig( $ );
+sub checkforupdate( $ );
+sub dumpconfig( ;$ );
+sub safemkdir( $ );
+sub setupdirs( $$$ );
+sub removeoldfiles( $$$\@ );
+sub findorphanfiles( $\% );
+sub unpackfiles( \@$$ );
+sub getdist( $$$$ );
+sub syncdist( $$$ );
+sub main();
+
+
+my $site = 'http://https://github.com/srcshelton/nekosync';
+my $update = "blob/master/history/$name.history";
+
+## Variables below here can be over-ridden in the config file
+
+my $distloc = '/usr/tmp/nekoware/dist';
+my $instloc = '/usr/tmp/nekoware/inst';
+my $oldloc  = 'obsolete';
+my $tmploc  = '/usr/tmp';
+
+my $gnupath = '/usr/nekoware/bin';
+
+my $indexfile;
+
+my ( $md5sum, $tar, $pax, $get, $rsync );
+
+my $getargs = "-q --passive-ftp -nd -np -U '$name/" . VERSION . "' -O";
+my $getchecktimeout = '-t3 -T5';
+my $gettimeout = '-t5 -T10';
+my $mirror = 'http://www.nekochan.net/nekoware/current';
+my $index = 'descript.ion';
+my $extra = undef;
+my $rsyncdefargs = "-budltOS --delete-after -T $tmploc --suffix= --numeric-ids";
+my $rsyncargs = '';
+my $rmirror = 'rsync.nekochan.net::nekoware/current/*.tardist';
+my $useget = TRUE;
+
+my $verbose = FALSE;
+my $debug = FALSE;
+my $safe = TRUE;
+my $pretend = TRUE;
+my $delete = FALSE;
+my $extract = TRUE;
+
+my $warnlevel = 10;
+
+my $usecolour = FALSE;
+my $termcolour = FALSE;
+
+my $launchswmgr = TRUE;
+my $updatecheck = TRUE;
+
+## Do not edit below this line
+
+my $configured = FALSE;
+
+my $show = FALSE;
+
+my $width = ( ( $ENV{ COLUMNS } or 80 ) - 2 );
+$width = 50 if $width < 50;
+
+my ( $reset, $bold, $nobold, $black, $red, $green, $yellow, $blue ) = ("") x 8;
+my ( $bang, $dash, $dot, $eroteme, $plus, $star ) = undef;
+#  ( "!",   "-",   ".",  "?",      "+",   "*" );
+
+my $info   = "INFO:   ";
+my $notice = "NOTICE: ";
+my $warn   = "WARN:   ";
+my $fatal  = "FATAL:  ";
+
+
+#
+## Utility subroutines
+#
+
+sub ifverbose( $;$ ) {
+	my ( $true, $false ) = @_;
+
+	my $OUT;
+	my $message = ( $verbose ? $true : $false );
+	
+	return undef unless $message;
+
+	if( $message =~ m/^(\e\[\d+m)?\S+:\s/sm ) {
+		my $colour = ( $message =~ m/^\e/ ? "" : $green );
+		$message =~ s/^(.*):(\s*)(.*)$/$colour$1$reset:$2$3$reset/;
+		open ( $OUT, ">&", STDERR ) or die "${fatal}Cannot dup STDERR: $!\n";
+	} else {
+#		chomp $message;
+#		$message =~ s/^\s+// if $message !~ /^\s*$/;
+#		$message = "$info$message$reset\n" if $message !~ /^\s*$/;
+		open ( $OUT, ">&", STDOUT ) or die "${fatal}Cannot dup STDOUT: $!\n";
+	}
+	print $OUT $message;
+	close( $OUT );
+	return TRUE;
+} # ifverbose
+
+sub ifnotverbose( $ ) {
+	return ifverbose( undef, shift );
+} # ifnotverbose
+
+sub ifdebug( $;$ ) {
+	my ( $true, $false ) = @_;
+
+	my $OUT;
+	my $message = ( $debug ? $true : $false );
+	
+	return undef unless $message;
+
+	if( $debug ) {
+		if( $message =~ m/^(\e\[\d+m)?\S+:\s/sm ) {
+			my $colour = ( $message =~ m/^\e/ ? "" : $blue );
+			$message =~ s/^(.*):(\s*)(.*)$/$colour$1$reset:$2$3$reset/;
+		} else {
+			$message =~ s/^debug://i;
+			$message =~ s/^\s+//;
+			chomp $message;
+			$message = "${blue}DEBUG$reset:  " . $message . "$reset\n"
+				if $message !~ /^\s*$/;
+		}
+
+		open ( $OUT, ">&", STDERR ) or die "${fatal}Cannot dup STDERR: $!\n";
+	} else {
+		# I don't think this code-path is actually used...
+		open ( $OUT, ">&", STDOUT ) or die "${fatal}Cannot dup STDOUT: $!\n";
+	}
+	print $OUT $message;
+	close( $OUT );
+	return TRUE;
+} # ifdebug
+
+sub ifnotdebug( $ ) {
+	return ifdebug( undef, shift );
+} # ifnotdebug
+
+sub httphead( $$\% ) {
+	my ( $host, $path, $response ) = @_;
+
+	return undef unless defined $host and defined $path;
+
+	my $socket = new IO::Socket::INET (
+		  PeerAddr => $host
+		, PeerPort => '80'
+		, Proto    => 'tcp'
+	) or return undef;
+
+	print $socket "HEAD $path HTTP/1.0\r\n";
+	print $socket "Host: $host\r\n";
+	print $socket "Connection: close\r\n";
+	print $socket "\r\n";
+
+	my $result = <$socket>;
+	my $headers = join( '', <$socket> );
+
+	close $socket;
+
+	if(( defined $result and $result ) and ( defined $headers and $headers )) {
+		$response -> { result } = $result;
+		$response -> { headers } = $headers;
+		return TRUE;
+	} else {
+		return undef;
+	}
+} # httphead
+
+sub getheader( $$ ) {
+	my ( $url, $header ) = @_;
+
+	return undef unless defined $url;
+
+	my $host = $1 if $url =~ m!^(?:ht|f)tp://([^/?&;]+)!;
+	my $path = $1 if $url =~ m!^(?:ht|f)tp://[^/?&;]+(/[^?&;]+)!;
+
+	return undef unless defined $host and defined $path;
+
+	my %response;
+	return undef if not httphead( $host, $path, %response );
+
+	if( defined $header and defined $response{ headers } ) {
+		foreach my $line ( split( /\r\n/, $response{ headers } ) ) {
+			if( $line =~ m/^$header: (.*)$/imo ) {
+				return $1;
+			}
+		}
+	} elsif( defined $response{ result } ) {
+		return $response{ result };
+	}
+
+	return undef;
+} # getheader
+
+#
+# Scary wrapper around open to redirect STDERR away from the console
+#  - thanks, Paul! :)
+#
+sub qopen( *;$$ ) {
+	$_[0] = gensym() unless( defined $_[0] );
+	my $file = qualify_to_ref( shift, caller() );
+
+	open( my $STDERR_SAVE, ">&", STDERR )
+		or die "${fatal}Cannot dup STDERR: $!\n";
+	open( STDERR, ">/dev/null" ) or die "${fatal}Cannot open /dev/null: $!\n";
+
+	my ( $return, $bang);
+	eval {
+		if ( scalar @_ == 1 ) {
+			$return = open( $file, shift );
+		} else {
+			$return = open( $file, shift, shift );
+		}
+		$bang = $!;
+	};
+
+	open( STDERR, ">&", $STDERR_SAVE );
+
+	die "$@\n" if $@;
+
+	$! = $bang;
+	return $return;
+} # qopen
+
+#
+# Source user variables...
+#
+
+sub readconfig( $ ) {
+	my $filename = shift;
+	my $File;
+
+	return undef unless $filename;
+
+	if( not open( $File, "<", $filename ) ) {
+		ifverbose( "${warn}Cannot read from file \"$filename\": $!\n" );
+	} else {
+		if( wantarray ) {
+			local $/ = "";
+			my @list = <$File>;
+			close $File;
+			return @list;
+		} else {
+			local $/ = undef;
+			my $string = <$File>;
+			close $File;
+			return $string;
+		}
+	}
+} # readconfig
+
+sub checkforupdate( $ ) {
+	my $message = shift;
+	my $version;
+
+	return "Utility setup incomplete" unless defined $get and defined $site
+		and defined $update;
+
+	my $command = join( ' ', $get, $getchecktimeout, $getargs, "-"
+	                       , '"' . "$site/$update" . '"', "|" );
+	qopen( my $File, $command ) or return undef;
+	while( <$File> ) {
+		chomp;
+		$version = $_;
+	}
+	return undef unless defined $version;
+
+	if( VERSION eq $version ) {
+		return '';
+	} else {
+		if( $message ) {
+			print "${notice}You are using $name " . VERSION . " whilst the "
+			    . "latest version is $version\n";
+			print "        Please visit $site/ to download the\n";
+			print "        most recent release of $name\n";
+		}
+		return $version;
+	}
+} # checkforupdate
+
+sub dumpconfig( ;$ ) {
+	my $extconf = shift;
+
+	my $error = "$bold$red";
+	my $problem = "$bold$blue";
+	my $noerror = "$reset";
+
+	my $warning = "[$error!$noerror]";
+	my $marginal = "[$problem?$noerror]";
+	my $okay = "   ";
+	my $notfound = "${error}Not found$noerror";
+
+	print "\nFile Locations\n";
+	print "--------------\n\n";
+	if( defined $extconf and -r $extconf ) {
+		print "$okay Configuration file:                   = \"$extconf\"\n";
+	} else {
+		print "$warning Configuration file:                      "
+		    . "$notfound\n";
+	}
+	print "" . ( ( defined $distloc and -d $distloc and -w $distloc )
+	    ? "$okay " : "$warning " ) . "tardist download path:   --dist"
+	    . ( defined $distloc ? "       = \"$distloc\""
+	                         : "          $notfound" ) . "\n";
+	print "" . ( ( defined $instloc and -d $instloc and -w $instloc )
+	    ? "$okay " : "$warning " ) . "Path for unpacked files: --inst"
+	    . ( defined $instloc ? "       = \"$instloc\""
+	                         : "          $notfound" ) . "\n";
+	print "" . ( ( defined $tmploc and -d $tmploc and -w $tmploc )
+	    ? "$okay " : "$warning " ) . "Temporary Directory:     --temp"
+	    . ( defined $tmploc ? "       = \"$tmploc\""
+	                        : "          $notfound" ) . "\n";
+	if( defined $distloc and defined $oldloc ) {
+		print "" . ( ( -d "$distloc/$oldloc" and -w "$distloc/$oldloc" )
+		    ? "$okay " : "$warning " )
+		    . "Directory for old files: --old        = \"$oldloc\"\n";
+		print "    (resolves to:                           "
+		    . "\"$distloc/$oldloc\")\n";
+	} else {
+		print "$warning Directory for old files: --old           $notfound\n";
+	}
+
+	print "\nBinary locations\n";
+	print "----------------\n\n";
+	# What can we look for to try to guess whether this path is sound?
+	if( defined $gnupath and -d $gnupath ) {
+		print "" . ( -x "$gnupath/env" ? "$okay "
+		                               : "$marginal " )
+		    . "Path to GNU binaries:    --path       = \"$gnupath\"\n";
+	} else {
+		print "" . ( ( defined $gnupath and -x "$gnupath/env" ) ? "$okay "
+		                                                        : "$warning " )
+		    . "Path to GNU binaries:    --path"
+		    . ( defined $gnupath ? "       = \"$gnupath\""
+		                         : "          $notfound" ) . "\n";
+	}
+	if( $usemd5sum and defined $md5sum ) {
+		print "" . ( -x "$md5sum" ? "$okay " : "$warning " )
+		    . "md5sum command:                       = \"$md5sum\"\n";
+	} elsif( $usemd5sum ) {
+		print "$warning md5sum command:                          "
+		    . "$notfound\n"
+	}
+	if( defined $tar ) {
+		if( -x $tar ) {
+			eval { system( "$tar --version >/dev/null 2>&1" ) };
+			if( $@ or $? ) {
+				print "$marginal "
+				    . "tar command:             --tar        = \"$tar ...\" "
+				    . "(${problem}not GNU tar$noerror)\n";
+			} else {
+				print "$okay "
+				    . "tar command:             --tar        = \"$tar ...\"\n";
+			}
+		} else {
+			print "$warning "
+			    . "tar command:             --tar        = \"$tar ...\"\n";
+		}
+	} else {
+		print "$warning tar command:             --tar           "
+		    . "$notfound\n"
+	}
+	if( defined $pax ) {
+		print "" . ( -x "$pax" ? "$okay " : "$warning " )
+		    . "pax command:             --pax        = \"$pax ...\"\n";
+	} else {
+		print "$warning pax command:             --pax           "
+		    . "$notfound\n"
+	}
+	if( defined $get ) {
+		my $space = '';
+		$space = ' ' if ( defined $getargs and not $getargs eq "" ) or
+		                ( defined $gettimeout and not $gettimeout eq "" );
+		print "" . ( -x "$get" ? "$okay " : "$warning " )
+		    . "get command:             --wget       = \""
+		    . join( $space, $get, $gettimeout, $getargs ) . " -\"\n";
+	} else {
+		print "$warning get command:             --wget          "
+		    . "$notfound\n";
+	}
+	if( defined $rsync and not $rsync eq "/usr/sbin/rsync") {
+		my $space = '';
+		$space = " " if defined $rsyncargs and not $rsyncargs eq "";
+		print "" . ( -x "$rsync" ? "$okay " : "$warning " )
+		    . "sync command:            --rsync      = "
+		    . "\"$rsync $rsyncdefargs$space$rsyncargs ...\"\n";
+	} else {
+		print "$warning sync command:            --rsync         "
+		    . "$notfound\n";
+	}
+	if( defined $rsync and $rsync eq "/usr/sbin/rsync" ) {
+		print STDERR "\n    ${bold}RCS Rsync (/usr/sbin/rsync) found instead "
+		    . "of Samba rsync - please\n";
+		print STDERR "    specify --rsync or --path to correct$reset\n\n";
+	}
+
+	print "\nDownload locations\n";
+	print "------------------\n\n";
+	if( defined $index ) {
+		print "    Index file:                             \"$index\"\n";
+		my $response;
+		if( defined $mirror ) {
+			$response = getheader( "$mirror/$index", undef );
+			print "" . ( ( defined $response and $response  =~ m/200/ )
+			    ? "$okay " : "$warning " )
+			    . "HTTP mirror:             --mirror     = \"$mirror\"\n";
+		} else {
+			print "$warning HTTP mirror:             --mirror        $notfound"
+			    . "\n";
+		}
+	} else {
+		print "$warning Index file:                              $notfound\n";
+		print "$warning HTTP mirror:             --mirror        $notfound\n";
+	}
+	if( defined $mirror and defined $extra ) {
+		( my $root = $mirror ) =~ s#/current(/)?##;
+		my @paths = split / /, $extra;
+		my $first = shift @paths;
+		my $last = pop @paths;
+		my $current = ( $first =~ m#^(ht|f)tp://# ? "$first"
+		                                          : "$root/$first" );
+		my $response = getheader( "$current/$index", undef );
+		print "" . ( ( defined $response and $response =~ m/200/ )
+		    ? "$okay " : "$warning " )
+		    . "Additional locations:    --extra      = \"$current";
+		foreach my $element ( @paths ) {
+			$current = ( $element =~ m#^(ht|f)tp://# ? "$element"
+		                                             : "$root/$element" );
+			$response = getheader( "$current/$index", undef );
+			print "\n" . ( ( defined $response and $response =~ m/200/ )
+			    ? "$okay " : "$warning " )
+			    . "                                         $current";
+		}
+		if( defined $last ) {
+			$current = ( $last =~ m#^(ht|f)tp://# ? "$last"
+			                                      : "$root/$last" );
+			$response = getheader( "$current/$index", undef );
+			print "\n" . ( ( defined $response and $response =~ m/200/ )
+			    ? "$okay " : "$warning " )
+			    . "                                         $current\"\n"
+		} else {
+			print "\"\n";
+		}
+	}
+	if( defined $rmirror ) {
+		print "    rsync mirror:            --mirror     = \"$rmirror\"\n";
+	} else {
+		print "$warning rsync mirror:            --mirror        $notfound\n";
+	}
+
+	print "\nGeneral settings\n";
+	print "----------------\n\n";
+	print "Synchronisation method:      --"
+	    . ( $useget ? "get" : "sync" ) . "\n";
+	print "\n";
+	print "Verbose output:              --"
+	    . ( $verbose ? "" : "no" ) . "verbose\n";
+	print "Debug output:                --"
+	    . ( $debug ? "" : "no" ) . "debug\n";
+	print "Safe file handling:          --"
+	    . ( $safe ? "" : "no" ) . "safe\n";
+	print "Modify filesystem:           --"
+	    . ( $pretend ? "" : "no" ) . "pretend\n";
+	print "Delete obsolete files:       --"
+	    . ( $delete ? "" : "no" ) . "delete\n";
+	print "Unpack downloaded packages:  --"
+	    . ( $extract ? "" : "no" ) . "extract\n";
+	print "\n";
+	print "Deletion warning threshold:  --warn       = \"$warnlevel\"\n";
+	print "\n";
+	print "Terminal width:              --width      = \""
+	    . ( $width + 2 ) . "\"\n";
+	print "\n";
+	print "${red}C${green}o${blue}l${yellow}o${red}u${green}r$reset:"
+	    . "                      --"
+	    . ( $usecolour ? "" : "no" ) . "colour" . ( $usecolour ? "  " : "" );
+	print "     "
+	    . "(But your current terminal doesn't support colour!)" 
+	    if( $usecolour and not $termcolour);
+	print "\n\n";
+	print "Launch swmgr on completion:  --"
+	    . ( $launchswmgr ? "" : "no" ) . "swmgr\n";
+	print "\n";
+	print "Correctly configured:        --configured =  "
+	    . ( ( not defined $configured or $configured ) ? "yes"
+	                                                   : "${error}no$noerror" ) . "\n";
+	print "\nVersions\n";
+	print "--------\n\n";
+	print "$name version:                           \"" . VERSION . "\"\n";
+	if( $updatecheck ) {
+		print "$name latest version:                    ";
+		my $latest = checkforupdate( FALSE );
+		if( defined $latest ) {
+			if( $latest eq "" ) {
+				print "\"" . VERSION . "\"\n";
+				$latest = "yes";
+			} else {
+				print "\"$latest\"\n";
+				$latest = "${error}no$noerror";
+			}
+		} else {
+			print " unknown\n";
+			$latest = "unknown";
+		}
+		print "$name is up to date:                      $latest\n";
+	}
+	print "Check for updates?           --update     =  "
+	    . ( $updatecheck ? "yes" : "no" ) . "\n";
+} # dumpconfig
+
+sub safemkdir( $ ) {
+	my $dir = shift;
+
+	return TRUE unless defined $dir and not $dir eq "";
+	return undef if $dir eq "/";
+
+	( my $parent = $dir ) =~ s#/+#/#g;
+	if( $parent =~ m#^/[^/]*$# ) {	## Fix vim syntax highlighting
+		$parent = "/";
+	} else {
+		$parent =~ s#/[^/]+$##;		## Fix vim syntax highlighting
+	}
+
+	if( not -d $parent ) {
+		my $result = safemkdir( $parent );
+		if( defined $result ) {
+			if( $result ) {
+				# mkdir failed
+				return TRUE;
+			} else {
+				# safe mode is on
+				return FALSE;
+			}
+		}
+	}
+
+	if( not -d $dir ) {
+		if( $safe ) {
+			return FALSE;
+		} else {
+			return TRUE if( not mkdir( $dir ) );
+		}
+	}
+
+	return undef;
+} # safemkdir
+
+sub setupdirs( $$$ ) {
+	my ( $dloc, $iloc, $oloc ) = @_;
+
+	my %dirs;
+	$dirs{ "$dloc" } = "Distribution/download" if $dloc;
+	$dirs{ "$iloc" } = "Installation" if $iloc;
+	$dirs{ "$dloc/$oloc" } = "Backup" if $oloc;
+	foreach my $dir ( keys( %dirs ) ) {
+		my $desc = $dirs{ $dir };
+		if( defined( my $error = safemkdir( "$dir" ) ) ) {
+			if( $error ) {
+				print STDERR "$fatal$desc directory \"$dir\" does not "
+				           . "exist\n";
+				die "        and cannot be created\n";
+			} else {
+				print STDERR "$fatal$desc directory \"$dir\" does not "
+				           . "exist\n";
+				die "        Safe mode enabled - not creating\n";
+			}
+		}
+	}
+
+	return undef;
+} # setupdirs
+
+sub removeoldfiles( $$$\@ ) {
+	my ( $dloc, $oloc, $delete, $oldpackages ) = @_;
+
+	return FALSE unless defined $dloc and -d $dloc;
+	return FALSE unless -w $dloc or $pretend;
+	return FALSE if defined $oloc
+		and not ( -d "$dloc/$oloc" and ( -w "$dloc/$oloc" or $pretend ) );
+
+	return undef unless defined $oloc or $delete;
+	return undef unless scalar( @$oldpackages ) and not $safe;
+
+	if( $delete ) {
+		ifnotverbose( "Removing obsolete files       " );
+	} else {
+		ifnotverbose( "Moving obsolete files         " );
+	}
+
+	my $counter = 0;
+
+	while( my $file = pop @$oldpackages ) {
+		if( -d $file ) {
+			ifverbose( "\"$file\" is a directory!\n", $bang );
+			$counter++ if defined $width;
+		} else {
+			if( $delete ) {
+				unlink( $file ) or die "${fatal}Error unlinking \"$file\": $!\n"
+					unless $pretend;
+			} else {
+				my $dest = "$dloc";
+				$dest .= "/$oloc" if $oloc;
+				eval {
+					0 == system( "mv -f \"$file\" \"$dest/\"" )
+						or die "${fatal}Error moving $file - $!\n"
+				} unless $pretend;
+			}
+			ifverbose( "\"$file\" " . ( $delete ? "removed" : "moved" ) . "\n"
+			         , $dot );
+			$counter++ if defined $width;
+		}
+		if( defined $width && not $verbose ) {
+			if( ( $counter + 30 ) > $width ) {
+				$counter = 0;
+				print STDOUT "\n" . " " x 30;
+			}
+		}
+	}
+	ifnotverbose( "\n" );
+
+	return undef;
+} # removeoldfiles
+
+sub findorphanfiles( $\% ) {
+	my ( $iloc, $instfiles ) = @_;
+	my @deletions;
+
+	return FALSE unless defined $iloc and -d $iloc;
+
+	ifnotverbose( "Checking for orphaned files   " );
+	opendir( my $Inst, $iloc )
+		or die "${fatal}Cannot opendir on \"$iloc\": $!\n";
+	my @files = readdir( $Inst );
+
+	my $counter = 0;
+
+	while( my $file = pop @files ) {
+		next if -d "$iloc/$file";
+		next if $file =~ /^.(.)?$/;
+		if( not exists $instfiles -> { $file } ) {
+			push( @deletions, "$iloc/$file" );
+			ifverbose( "$file doesn't belong to any current package\n", $dash );
+			$counter++ if defined $width;
+		}
+		if( defined $width && not $verbose ) {
+			if( ( $counter + 30 ) > $width ) {
+				$counter = 0;
+				print STDOUT "\n" . " " x 30;
+			}
+		}
+	}
+	closedir( $Inst );
+	ifnotverbose( "\n" );
+
+	return removeoldfiles( $iloc, undef, TRUE, @deletions );
+} # findorphanfiles
+
+sub unpackfiles( \@$$ ) {
+	my ( $files, $dloc, $iloc ) = @_;
+	my %instfiles;
+	my %errors;
+	my %messages;
+	my $lastname;
+
+	return FALSE unless scalar( @$files );
+	return FALSE unless defined $dloc and -d $dloc;
+	return FALSE unless defined $iloc and -d $iloc;
+	return FALSE unless -w $iloc or $pretend;
+
+	ifnotverbose( "Unpacking updated files       " );
+	ifdebug( "\n" );
+
+	sub pkgsort {
+		my $shortcmp = FALSE;
+		my ( $namea, $nameb );
+
+		if( $a =~ m/^neko_(.*)-[0-9].*$/ ) {
+			( $namea ) = ( lc( $a ) =~ m/^(?:neko_)?(.*)[-_][0-9].*$/ );
+		} else {
+			( $namea ) = ( lc( $a ) =~ m/(?:neko_)?(.*)\.tardist$/ );
+			$shortcmp = TRUE;
+		}
+
+		if( $b =~ m/^neko_(.*)-[0-9].*$/ ) {
+			( $nameb ) = ( lc( $b ) =~ m/^(?:neko_)?(.*)[-_][0-9].*$/ );
+		} else {
+			( $nameb ) = ( lc( $b ) =~ m/(?:neko_)?(.*)\.tardist$/ );
+			$shortcmp = TRUE;
+		}
+
+		return ( $namea cmp $nameb ) if $shortcmp;
+
+		if( $namea eq $nameb ) {
+			my ( $vera ) = ( $a =~ m/^.*[-_]([0-9].*)\.tardist$/ );
+			my ( $verb ) = ( $b =~ m/^.*[-_]([0-9].*)\.tardist$/ );
+
+			$vera =~ s/[[:alpha:]]//g;
+			$vera =~ s/[-_]/./g;
+			$vera =~ s/\.+/./g;
+			$verb =~ s/[[:alpha:]]//g;
+			$verb =~ s/[-_]/./g;
+			$verb =~ s/\.+/./g;
+
+			my @numbersa = split( /\./, $vera );
+			my @numbersb = split( /\./, $verb );
+
+			my $max = max( scalar @numbersa, scalar @numbersb );
+			for( my $n = 0 ; $n <= $max ; $n++ ) {
+				my $numa = $numbersa[ $n ];
+				my $numb = $numbersb[ $n ];
+				my $existsa = defined $numa;
+				my $existsb = defined $numb;
+
+				# NB: Backwards - we want the highest version number first!
+				if( $existsa and $existsb ) {
+					return $numb <=> $numa if $numa != $numb;
+				} elsif( $existsa ) {
+					return -1;
+				} elsif( $existsb ) {
+					return 1;
+				} else {
+					return 0;
+				}
+			}
+			return 0;
+		} else {
+			return $namea cmp $nameb;
+		}
+	}
+
+	my $counter = 0;
+	my @list = sort pkgsort @$files;
+	my $continue = TRUE;
+
+	foreach my $file ( @list ) {
+		my ( $name ) = ( $file =~ m/^(?:neko_)?(.*)\.tardist$/ );
+
+		my $extradirs;
+		my $replace = FALSE;
+		my $state;
+
+		ifverbose( "Processing " . $name . "\n" );
+		my $command = join( ' ', $tar, "-tvf", '"' . "$dloc/$file" . '"', "|" );
+		qopen( my $File, $command )
+			or die "${fatal}Cannot open pipe to $tar: $!\n";
+		while( <$File> ) {
+			my @fields = split( /\s+/ );
+			if( 6 == scalar @fields or 8 == scalar @fields ) {
+				my $filename;
+				if( 6 == scalar @fields ) {
+					( $filename = $fields[ 5 ] ) =~ s#^\./##;
+				} elsif ( 8 == scalar @fields ) {
+					( $filename = $fields[ 7 ] ) =~ s#^\./##;
+				} else {
+					die "${fatal}Invalid output read from $tar\n";
+				}
+				if( $filename =~ m#tmp/# ) {
+					ifverbose( "$warn$filename from $name is within a "
+						. "subdirectory - attempting to correct...\n" );
+					if( defined $pax and -x $pax ) {
+						$errors{ $file } = "$file contains directory entries"
+						. "\n\tcorrection with pax attempted...";
+					} else {
+						$errors{ $file } = "$file contains directory entries";
+					}
+					( $extradirs = $filename ) =~ s:^(.*/)[^/]+$:$1: ;
+					$filename =~ s:^.*/([^/]+)$:$1: ;
+					$state = '!';
+				}
+				if( defined $instfiles{ $filename } ) {
+					$messages{ $file } = "$name clashes with files from "
+					                   . "another package"
+					                   . ( defined $lastname
+					                     ? "\n\t(probably $lastname)" : "" );
+				} else {
+					$lastname = $name;
+					my $size = $fields[ 2 ];
+					$instfiles{ $filename } = $size;
+					if( scalar( my $result = stat( "$iloc/$filename" ) ) ) {
+						my $fsize = $result -> size;
+						if( not ( $size eq $fsize ) ) {
+							$replace = TRUE;
+							ifdebug( "$yellow$iloc/$filename from $name has "
+							       . "changed from $size to $fsize" );
+						}
+					} else {
+						$replace = TRUE;
+						ifdebug( "${red}stat() failed on $iloc/$filename" );
+					}
+				}
+				if( $replace ) {
+					my $command;
+					if( defined $extradirs ) {
+						if( defined $pax and -x $pax ) {
+							if( defined $debug ) {
+								$command = join( ' ', 'cd "' . "$iloc" . '" &&'
+									                , $pax, '-rvf'
+									                , '"' . "$dloc/$file" . '"'
+									                , "-s :${extradirs}::p"
+									                , ';', 'cd -'
+								                    , '>/dev/null 2>&1' );
+							} else {
+								$command = join( ' ', 'cd "' . "$iloc" . '" &&'
+									                , $pax, "-rs :$extradirs::"
+									                , '-f'
+									                , '"' . "$dloc/$file" . '"'
+									                , '>/dev/null 2>&1'
+									                , ';', 'cd -'
+								                    , '>/dev/null 2>&1' );
+							}
+						} else {
+							undef $command;
+						}
+					} else {
+						eval { system( "$tar --version >/dev/null 2>&1" ) };
+						if( $@ or $? ) {
+							# Assume SGI tar
+							$command = join( ' ', 'cd "' . "$iloc" . '" &&'
+							                    , $tar, '-xf'
+							                    , '"' . "$dloc/$file" . '"'
+							                    , '>/dev/null 2>&1' 
+							                    , ';', 'cd -'
+							                    , '>/dev/null 2>&1' );
+						} else {
+							# Assume GNU tar
+							$command = join( ' ', $tar, '-xf'
+							                    , '"' . "$dloc/$file" . '"'
+							                    , '-C' , $iloc
+							                    , '>/dev/null 2>&1' );
+						}
+					}
+					ifdebug( "$green\$command is \"$command\"" )
+						if defined $command;
+					if( not $pretend  and defined $command ) {
+						ifverbose( "Unpacking $file\n" );
+						eval { system( $command ) };
+						if( $@ or $? ) {
+							$errors{ $file } = "$file is corrupt and cannot be "
+							                 . "unpacked";
+							ifverbose( "\n${warn}Unable to unpack "
+							         . "$file: $@ ($?)\n" );
+							$state = '!';
+						} else {
+							ifverbose( "Unpacked $name successfully\n" );
+							$state = '+' if not defined $state or
+							             ( defined $state and $state eq '.' );
+						}
+					}
+				} else {
+					ifverbose( "$filename from $file unchanged\n" );
+					$state = '.' if not defined $state;
+				}
+			} else {
+				ifdebug( "${red}Unknown format returned from "
+				       . "$tar: \"$reset@fields$red\"" );
+				ifverbose( "${warn}Archive listing failed: $@\n" );
+				$state = '!';
+				$continue = FALSE;
+			}
+		}
+		if( defined $state and $state eq '.' ) {
+			ifnotverbose( $dot );
+		} elsif( defined $state and $state eq '+' ) {
+			ifnotverbose( $plus );
+		} elsif( not defined $state or $state eq '!' ) {
+			ifnotverbose( $bang );
+		} else {
+			ifnotverbose( $eroteme );
+		}
+		$counter++ if defined $width;
+		if( defined $width && not $verbose ) {
+			if( ( $counter + 30 ) > $width ) {
+				$counter = 0;
+				print STDOUT "\n" . " " x 30;
+			}
+		}
+	}
+
+	print STDOUT "\n";
+	print STDERR "\n" if( %messages );
+	foreach my $message ( sort( values( %messages ) ) ) {
+		print STDERR "$info$message\n";
+	}
+	print STDERR "\n" if( %messages );
+	print STDERR "\n" if( %errors and not %messages );
+	foreach my $message ( sort( values( %errors ) ) ) {
+		print STDERR "$warn$message\n";
+	}
+	print STDERR "\n" if( %errors );
+
+	if( $continue ) {
+		return findorphanfiles( $iloc, %instfiles );
+	} else {
+		return undef;
+	}
+} # unpackfiles
+
+sub getdist( $$$$ ) {
+	my ( $dloc, $iloc, $oloc, $delete ) = @_;
+	my %md5sums;
+	my @downloads;
+	my @oldpackages;
+	my $counter = 0;
+	my $checksum;
+
+	return FALSE unless defined $dloc;
+	return FALSE unless defined $index and defined $mirror;
+	return FALSE unless defined $get and -x $get;
+
+	setupdirs( $dloc, $iloc, $oloc );
+	return FALSE unless -d $dloc and -w $dloc;
+
+	autoflush STDOUT TRUE;
+	if( not defined $indexfile ) {
+		ifverbose( "Downloading $index from $mirror/ - please wait...",
+				"Downloading and parsing index file, please wait..." );
+		ifdebug( "\n\n" );
+	} else {
+		print( "Using $indexfile as package list..." );
+	}
+
+	my $warning = FALSE;
+	my $needsupdate = FALSE;
+
+	my $contents = undef;
+	my $File;
+	if( not defined $indexfile ) {
+		my $command = join( ' ', $get, $gettimeout, $getargs, "- "
+		                       , '"' . $mirror . "/" . $index . '"', "|" );
+		qopen( $File, $command )
+			or die "${fatal}Cannot open pipe to $get: $!\n";
+	} else {
+		open( $File, "<", $indexfile )
+			or die "${fatal}Cannot open $indexfile for reading: $!\n";
+	}
+	chdir $dloc or die "${fatal}Cannot chdir to \"$dloc\"\n";
+	while( <$File> ) {
+		my @fields = split( /\s+/ );
+		if( scalar( @fields ) ) {
+			my $filename = $fields[ 0 ];
+			my $line = join( ' ', @fields );
+			if( $line =~ m/[[:space:]]([[:xdigit:]]{32})[[:space:]]/ ) {
+				my $sum = $1;
+				$md5sums{ $filename } = $sum;
+				ifdebug( "Found sum $sum for file $filename\n" );
+			} else {
+				if( not $warning ) {
+					ifdebug( "Cannot identify MD5 sum for file "
+					       . "$filename - skipping further MD5 checks\n" );
+					$warning = TRUE;
+				}
+				if( defined( my $size = getheader( join( '/', $mirror
+				                                            , $filename )
+				                                 , "Content-Length" ) ) ) {
+					ifdebug( "Found size $size for file $filename\n" );
+					$md5sums{ $filename } = $size;
+				} else {
+					ifnotdebug( "\n" ) unless $needsupdate;
+					print STDERR "${warn}Can't find MD5 sum or file size for "
+					           . "$filename\n";
+					$needsupdate = TRUE;
+				}
+			}
+			$contents .= $line;
+		}
+	}
+	close( $File );
+
+	if( $warning and not $needsupdate ) {
+		print STDERR "\n${warn}MD5 sums in $index corrupt or not present\n"
+		           . "        Please contact mirror maintainer\n";
+		ifnotdebug( "\n" );
+	}
+	if( $needsupdate ) {
+		print STDERR "\n${notice}Index may be out of date - please contact "
+		           . "mirror maintainer\n";
+		ifnotdebug( "\n" );
+	}
+	if( not %md5sums ) {
+		print STDERR "\n${warn}Specified directory $mirror/ is empty, or "
+		           . "network disconnected\n";
+		return FALSE;
+	}
+
+	if( defined $contents and not $usemd5sum ) {
+		ifdebug( "Generating MD5 sum of $index... " );
+		my $digest = Digest::MD5 -> new();
+		$digest -> add( $contents );
+		$checksum = $digest -> hexdigest();
+		$digest = undef;
+		ifdebug( $checksum . "\n" );
+	}
+
+	foreach my $file ( sort( keys( %md5sums ) ) ) {
+		delete $md5sums{ $file } unless $file =~ /\.tardist$/;
+	}
+	ifverbose( " read " . keys( %md5sums ) . " packages\n"
+	         , ( ( $debug || $warning || $needsupdate ) ? "" : " done" )
+	         . "\nChecking for updated packages " );
+	ifdebug( "\n" );
+
+	foreach my $file ( sort( keys( %md5sums ) ) ) {
+		ifdebug( "Looking for " . $file . "\n" );
+		if( -r $file ) {
+			open( my $File, "<", $file )
+				or die "${fatal}Cannot open $file: $!\n";
+			if( length( $md5sums{ $file } ) eq 32 ) {
+				my $digest = Digest::MD5 -> new();
+				$digest -> addfile( $File );
+				my $sum = $digest -> hexdigest();
+				$digest = undef;
+				if( $sum eq $md5sums{ $file } ) {
+					ifverbose( "$file is up to date\n",
+					         ( $debug ? undef : $dot ) );
+					$counter++ if defined $width;
+				} else {
+					ifverbose( "$file: Digest $sum does not match archive "
+					         . "digest " . $md5sums{ $file } . "\n", $star );
+					push( @downloads, $file );
+					$counter++ if defined $width;
+				}
+			} else {
+				my $result = stat( $file )
+					or die "stat() failed on $dloc/$file\n";
+				my $size = $result -> size;
+				if( $size eq $md5sums{ $file } ) {
+					ifverbose( "$file is of correct size\n",
+					         ( $debug ? undef : $dot ) );
+					$counter++ if defined $width;
+				} else {
+					ifverbose( "$file: File size $size does not match archive "
+					         . "file length " . $md5sums{ $file } . "\n"
+					         , $star );
+					push( @downloads, $file );
+					$counter++ if defined $width;
+				}
+			}
+		} else {
+			push( @downloads, $file );
+			ifverbose( $file . ": Does not exist on local filesystem\n"
+			         , $plus );
+			$counter++ if defined $width;
+		}
+		if( defined $width && not $verbose ) {
+			if( ( $counter + 30 ) > $width ) {
+				$counter = 0;
+				print STDOUT "\n" . " " x 30;
+			}
+		}
+	}
+
+	opendir( my $Dist, $dloc ) or die "${fatal}Cannot opendir on $dloc: $!\n";
+	{
+		my @files = readdir( $Dist );
+		while( my $file = pop @files ) {
+			next if -d "$dloc/$file";
+			next unless $file =~ /\.tardist$/;
+			if( not( defined $md5sums{ $file } ) ) {
+				push( @oldpackages, "$dloc/$file" );
+				ifverbose( "${yellow}INFO:    $file removed from remote "
+				         . "archive\n", $dash );
+				$counter++ if defined $width;
+			}
+			if( defined $width && not $verbose ) {
+				if( ( $counter + 30 ) > $width ) {
+					$counter = 0;
+					print STDOUT "\n" . " " x 30;
+				}
+			}
+		}
+		closedir( $Dist );
+	}
+
+	my $number = scalar( @downloads );
+	my $spaces = length( $number );
+
+	ifnotverbose( "\n" );
+	print STDOUT "\n" . scalar( @oldpackages) . " files are obsolete and "
+	           . "$number " . ( 1 == $number ? "file is" : "files are" )
+	           . " new or ha" . ( 1 == $number ? "s" : "ve" ) . " been "
+	           . "modified\n\n";
+
+	if( scalar( @oldpackages ) >= $warnlevel ) {
+		print STDERR "\n${warn}More than $warnlevel packages will be "
+		           . "removed!\n";
+		print STDOUT "        Press ctrl+c now to cancel\n\n";
+		sleep( 5 );
+	}
+
+	@downloads = sort( @downloads );
+	$number = 0;
+
+	while( my $file = pop @downloads ) {
+		$number++;
+		my $command = join( ' ', $get, $gettimeout, $getargs, "-"
+		                       , '"' . $mirror . "/" . $file . '"', "|" );
+		print STDOUT "(" . ( " " x ( $spaces - length( $number ) ) ) . $number
+		           . ") Downloading $file  ";
+		qopen( my $InFile, $command )
+			or die "${fatal}Cannot open pipe to $get: $!\n";
+		open( my $OutFile, ">", $dloc . "/" . $file )
+			or die "${fatal}Cannot open $file for writing: $!\n";
+		my $counter = 0;
+		my $iteration = 0;
+		my @characters = ( '/', '-', '\\', '|' );
+		while( my $data = <$InFile> ) {
+			if( 0 eq ( $iteration++ % 20 ) ) {
+				print STDOUT "\b"
+				           . $characters[ $counter++ % scalar( @characters ) ];
+			}
+			print $OutFile $data;
+		}
+		close( $OutFile );
+		if( close( $InFile ) ) {
+			print STDOUT "\bdone\n";
+		} else {
+			ifnotverbose( "\b\n" );
+			print STDERR "$warn$get returned $? - Bad descript.ion or "
+			           . "corrupt download?\n";
+		}
+	}
+
+	if( not defined $indexfile and not $usemd5sum ) {
+		ifdebug( "\nGenerating second MD5 sum of $index..." );
+		{
+			my $contents = undef;
+			my $command = join( ' ', $get, $gettimeout, $getargs, "- "
+			                       , '"' . $mirror . "/" . $index . '"', "|" );
+			qopen( my $File, $command )
+				or die "${fatal}Cannot open pipe to $get: $!\n";
+			while( <$File> ) {
+				my @fields = split( /\s+/ );
+				if( scalar( @fields ) ) {
+					my $line = join( ' ', @fields );
+					$contents .= $line;
+				}
+			}
+			close( $File );
+			if( defined $contents ) {
+				if( defined $checksum ) {
+					my $digest = Digest::MD5 -> new();
+					$digest -> add( $contents );
+					if( $checksum ne $digest -> hexdigest() ) {
+						die "$fatal$index changed during operation - please "
+						  . "try again...\n"
+					}
+					$digest = undef;
+					ifdebug( " checksums match\n\n" );
+				} else {
+					print STDERR "${warn}Cannot generate checksums - was a "
+					           . "valid index downloaded?\n";
+				}
+			} else {
+				die "$fatal$index no longer exists, cannot verify downloaded "
+				  . "packages\n        Please check server connectivity and "
+				  . "try again...\n"
+			}
+		}
+	}
+
+	my @files = keys( %md5sums );
+	unpackfiles( @files, $dloc, $iloc ) if defined $iloc and $extract;
+	removeoldfiles( $dloc, $oloc, $delete, @oldpackages );
+	return undef;
+} # getdist
+
+sub syncdist( $$$ ) {
+	my ( $dloc, $iloc, $oloc ) = @_;
+	my @tardists;
+	my $counter = 0;
+
+	return FALSE unless defined $dloc;
+	return FALSE unless defined $rmirror;
+	return FALSE unless defined $rsync and -x $rsync;
+
+	setupdirs( $dloc, $iloc, $oloc );
+	return FALSE unless -d $dloc and -w $dloc;
+	return FALSE if defined $oloc and not ( -d "$dloc/$oloc"
+	                                    and -w "$dloc/$oloc" );
+
+	autoflush STDOUT TRUE;
+	chdir $dloc or die "${fatal}Cannot chdir to \"$dloc\"\n";
+	ifverbose( "Starting rsync connection to $rmirror - please wait... \n"
+	         , "Starting rsync, please wait...\n" );
+	my $backup = '';
+	$backup = "--backup-dir '$dloc/$oloc'" if defined $oloc;
+	my $command = join( ' ', $rsync, $rsyncargs , $backup, $rmirror
+	                       , '"' . "$dloc" . '"' );
+	ifverbose( "Executing $command\n" );
+	system( $command ) == 0 or die "rsync failed: $?\n";
+
+	print STDOUT "\n";
+	print STDOUT "Reading directory contents    ";
+
+	opendir( my $Dist, $dloc )
+		or die "${fatal}Cannot opendir on \"$dloc\": $!\n";
+	{
+		my @files = readdir( $Dist );
+		while( my $file = pop @files ) {
+			next if -d $file;
+			next unless $file =~ /\.tardist$/;
+			push( @tardists, "$file" );
+			ifnotverbose( $dot );
+			$counter++ if defined $width;
+			if( defined $width && not $verbose ) {
+				if( ( $counter + 30 ) > $width ) {
+					$counter = 0;
+					print STDOUT "\n" . " " x 30;
+				}
+			}
+		}
+		closedir( $Dist );
+	}
+	print STDOUT "\n";
+
+	return unpackfiles( @tardists, $dloc, $iloc ) if defined $iloc and $extract;
+	return undef;
+} # syncdist
+
+sub main() {
+	our ( $opt_version, $opt_help, $opt_colour, $opt_show, $opt_configured
+	    , $opt_mirror, $opt_get, $opt_wget, $opt_sync, $opt_rsync, $opt_width
+	    , $opt_check , $opt_extract, $opt_pretend );
+
+	sub showconfig( $;$$ ) {
+		my ( $optionname, $configfile, $configname ) = @_;
+
+		my $usenext = FALSE;
+		my $showconfig = FALSE;
+
+		# The former makes more sense, the latter is correct for this usage ;)
+		#$configname = $optionname if not defined $configname;
+		$configname = ( defined $configfile ? $configfile : $optionname )
+			if not defined $configname;
+
+		foreach my $option ( @ARGV ) {
+			if( not $usenext ) {
+				if( $option =~ m/^--show=\S+|^--showconfig=\S+/i ) {
+					( my $argument = $option ) =~ s/^.*=//;
+					$showconfig = TRUE if $argument =~ m/^$optionname$/i;
+				} elsif( $option =~ m/^--show$|^--showconfig$/i ) {
+					$usenext = TRUE;
+				}
+			} else {
+				$showconfig = TRUE if $option =~ m/^$optionname$/i;
+			}
+			if( $showconfig and defined $configfile ) {
+				if( -r $configfile ) {
+					print STDOUT "$name " . VERSION . " $configname values:\n";
+					dumpconfig( $configfile );
+					exit 0;
+				} else {
+					die "No configuration file found\n";
+				}
+			} elsif( $showconfig ) {
+				print STDOUT "$name " . VERSION . " $configname values:\n";
+				dumpconfig();
+				exit 0;
+			}
+		}
+	}
+
+	showconfig( "default(s)?", undef, "default" );
+
+	my $extconf;
+	$extconf = "/usr/nekoware/etc/$name.conf"
+		if -r "/usr/nekoware/etc/$name.conf";
+	$extconf = $ENV{ HOME } . "/.$name.conf"
+		if -r $ENV{ HOME } . "/.$name.conf";
+	$extconf = "/etc/$name.conf" unless defined $extconf;
+
+	if( -r $extconf ) {
+		# If there's a config file, it either sets $configured, or has been
+		# edited...
+		$configured = undef;
+		eval readconfig( $extconf );
+		$getargs = '' unless defined $getargs;
+		$rsyncargs = '' unless defined $rsyncargs;
+	}
+
+	showconfig( "file", $extconf );
+
+	Getopt::Long::Configure( "posix_default", "bundling", "gnu_compat" );
+	GetOptions(
+		  'check|checkonly!'
+		, 'colour|color!'
+		, 'configured|config!'
+		, 'debug!' =>				\$debug
+		, 'delete|del!' =>			\$delete
+		, 'distloc|dist|d=s' =>		\$distloc
+		, 'extract|unpack!'
+		, 'extra|beta=s' =>			\$extra
+		, 'get!'
+		, 'gnupath|gnu|path|g=s' =>	\$gnupath
+		, 'help|h'
+		, 'index|file=s' =>			\$indexfile
+		, 'instloc|inst|i=s' =>		\$instloc
+		, 'mirror=s'
+		, 'oldloc|old|o=s' =>		\$oldloc
+		, 'pax=s' =>				\$pax
+		, 'pretend|p!'
+		, 'rsync=s' =>				\$rsync
+		, 'safe!' =>				\$safe
+		, 'show|showconfig:s'
+		, 'swmgr|launch|s!' =>		\$launchswmgr
+		, 'sync!'
+		, 'tar=s' =>				\$tar
+		, 'tmploc|tmp|temp|t=s' =>	\$tmploc
+		, 'update!' =>				\$updatecheck
+		, 'verbose!' =>				\$verbose
+		, 'version|v'
+		, 'warn|w=i' =>				\$warnlevel
+		, 'wget=s' =>				\$get
+		, 'width|columns=i'
+	) or die "\n";
+
+	if( defined $opt_version and $opt_version ) {
+		print STDOUT "$name version " . VERSION . "\n";
+		exit 0;
+	}
+	if( defined $opt_help and $opt_help ) {
+		print STDOUT "Usage: $name [settings] [options] [--get|--sync] [[-- |--mirror=]<mirror>]\n\n";
+		print STDOUT "                 settings = { [--dist=<path>] [--inst=<path>] [--temp=<path>]\n";
+		print STDOUT "                              [--old=<directory>]\n";
+		print STDOUT "                              [--extra=\"<paths>\"] }\n";
+		print STDOUT "                              [--path=<path>] [--rsync=<path>] [--tar=<path>]\n";
+		print STDOUT "                              [--pax=<path>] [--wget=<path>]\n";
+		print STDOUT "                              [--warn=<number>] [--width=<number>]\n";
+		print STDOUT "                            }\n";
+		print STDOUT "                 options  = { [--colour] [--configured] [--debug]\n";
+		print STDOUT "                              [--delete] [--extract] [--pretend] [--safe]\n";
+		print STDOUT "                              [--showconfig[=default|=file|=actual]]\n";
+		print STDOUT "                              [--swmgr] [--update] [--verbose]\n";
+		print STDOUT "                            }\n";
+		print STDOUT "\n";
+		print STDOUT "                 Note: --debug implies --pretend, use --nopretend to override.\n";
+		exit 0;
+	}
+
+	if( not defined $opt_colour or ( defined $opt_colour and $opt_colour ) ) {
+		$usecolour = TRUE;
+
+		if( defined( $ENV{ TERM } ) and $ENV{ TERM } =~ /xterm|screen/ ) {
+			$termcolour = TRUE;
+			$reset = "\e[0m";
+			$bold = "\e[1m";
+			$nobold = "\e[22m";
+			$black = "\e[30m";
+			$red = "\e[31m";
+			$green = "\e[32m";
+			$yellow = "\e[33m";
+			$blue = "\e[34m";
+		} else {
+			$termcolour = FALSE;
+		}
+
+		$info = "${green}INFO$reset:   ";
+		$notice = "${blue}NOTICE$reset: ";
+		$warn = "${red}WARN$reset:   ";
+		$fatal = "$bold${red}FATAL$reset:  ";
+
+		$bang = "$red!" if not defined $bang;
+		$dash = "$yellow-" if not defined $dash;
+		$dot = "$blue." if not defined $dot;
+		$eroteme = "$yellow?" if not defined $eroteme;
+		$plus = "$green+" if not defined $plus;
+		$star = "$green*" if not defined $star;
+	}
+	$bang    = "!" if not defined $bang;
+	$dash    = "-" if not defined $dash;
+	$dot     = "." if not defined $dot;
+	$eroteme = "?" if not defined $eroteme;
+	$plus    = "+" if not defined $plus;
+	$star    = "*" if not defined $star;
+
+	# We can't use $reset here, because the '[' needs escaping :(
+	$bang    = "$bang$reset"    if $bang    !~ m/\e\[0m$/;
+	$dash    = "$dash$reset"    if $dash    !~ m/\e\[0m$/;
+	$dot     = "$dot$reset"     if $dot     !~ m/\e\[0m$/;
+	$eroteme = "$eroteme$reset" if $eroteme !~ m/\e\[0m$/;
+	$plus    = "$plus$reset"    if $plus    !~ m/\e\[0m$/;
+	$star    = "$star$reset"    if $star    !~ m/\e\[0m$/;
+
+	$pretend = TRUE if $debug;
+	if( defined $opt_pretend and not $opt_pretend ) {
+		$pretend = FALSE;
+	}
+
+	if( not defined $opt_mirror and defined ( my $arg = shift( @ARGV ) ) ) {
+		$opt_mirror = $arg;
+	}
+	if( defined $opt_sync and $opt_sync ) {
+		$rmirror = $opt_mirror if defined $opt_mirror;
+		$useget = FALSE;
+	} else {
+		$mirror = $opt_mirror if defined $opt_mirror;
+		$useget = TRUE;
+	}
+	if( defined $opt_wget and $opt_wget =~ m/ / ) {
+		my @newget = split( /\s+/, $get );
+		$get = shift( @newget );
+		$getargs = join( ' ', @newget );
+	}
+	if( defined $opt_rsync and $opt_rsync =~ m/ / ) {
+		my @newrsync = split( /\s+/, $rsync );
+		$rsync = shift( @newrsync );
+		$rsyncargs = join( ' ', @newrsync );
+		$rsyncdefargs = '';
+	}
+	if( defined $indexfile and $indexfile ) {
+		die "${fatal}Cannot read $indexfile\n" unless -r $indexfile;
+	}
+	if( defined $opt_configured and $opt_configured ) {
+		$configured = TRUE;
+	}
+	if( defined $opt_extract ) {
+		$extract = $opt_extract;
+	}
+	if( defined $opt_width ) {
+		$width = int( $opt_width ) - 2;
+	}
+
+	if( ( defined $opt_get and $opt_get ) and
+	    ( defined $opt_sync and $opt_sync ) ) {
+		print STDOUT "${fatal}Cannot use sync and get together - please "
+		           . "specify at most one of\n";
+		print STDOUT "        --get and --sync\n";
+		exit 1;
+	}
+
+	if( defined $gnupath and -d $gnupath and -x "$gnupath/bash" ) {
+		eval { chomp( $md5sum = `$gnupath/bash -c "type -pf $gnupath/md5sum"` ) }
+			if( $usemd5sum and ( not defined $md5sum or not -x $md5sum ) );
+		eval { chomp( $tar = `$gnupath/bash -c "type -pf $gnupath/tar"` ) }
+			if( not defined $tar or not -x $tar );
+		eval { chomp( $pax = `$gnupath/bash -c "type -pf $gnupath/pax"` ) }
+			if( not defined $pax or not -x $pax );
+		eval { chomp( $get = `$gnupath/bash -c "type -pf $gnupath/wget"` ) }
+			if( not defined $get or not -x $get );
+		eval { chomp( $rsync = `$gnupath/bash -c "type -pf $gnupath/rsync"` ) }
+			if( not defined $rsync or not -x $rsync );
+	}
+	eval { chomp( $md5sum = `bash -c "type -pf md5sum"` ) }
+		if( $usemd5sum and ( not defined $md5sum or not -x $md5sum ) );
+	eval { chomp( $tar = `bash -c "type -pf tar"` ) }
+		if( not defined $tar or not -x $tar );
+	eval { chomp( $pax = `bash -c "type -pf pax"` ) }
+		if( not defined $pax or not -x $pax );
+	eval { chomp( $get = `bash -c "type -pf wget"` ) }
+		if( not defined $get or not -x $get );
+	eval { chomp( $rsync = `bash -c "type -pf rsync"` ) }
+		if( not defined $rsync or not -x $rsync );
+
+	$md5sum = undef unless defined $md5sum and -x $md5sum;
+	$tar = undef unless defined $tar and -x $tar;
+	$pax = undef unless defined $pax and -x $pax;
+	$get = undef unless defined $get and -x $get;
+	$rsync = undef unless defined $rsync and -x $rsync;
+
+	if( defined $opt_check and $opt_check ) {
+		my $latest = checkforupdate( TRUE );
+		if( defined $latest ) {
+			print STDOUT "$name " . VERSION . " is up to date\n"
+				if $latest eq "";
+			exit 0;
+		} else {
+			print STDERR "Cannot download version information from\n"
+			           . "$site/$update\n";
+			exit 1;
+		}
+	}
+
+	if( defined $opt_show ) {
+		if( $opt_show eq "default" or $opt_show eq "file" ) {
+			die "Uncaught show option: $opt_show\n";
+		} elsif( $opt_show eq "" or $opt_show eq "actual" ) {
+			print STDOUT "$name " . VERSION . " actual values:\n";
+			dumpconfig( $extconf );
+			exit 0;
+		} else {
+			die "Unknown argument: $opt_show\n";
+		}
+	}
+
+	if( not -r $extconf ) {
+		print STDERR "${notice}No external configuration file found, using "
+		           . ( ( not $configured ) ? "defaults..."
+		                                   : "only command line options..." )
+		           . "\n\n";
+	}
+
+	if( defined $rsync and $rsync eq "/usr/sbin/rsync" ) {
+		print STDERR "${warn}RCS Rsync found instead of rsync - please "
+		    . "specify --rsync or --path\n";
+		$rsync = undef;
+	}
+
+	die "$name has not yet been configured - please edit\n  $name.conf and "
+	  . "ensure that sane defaults are set before\n  re-running.\n"
+		if defined( $configured ) and ( not $configured ) and ( not $show );
+
+	die "${fatal}Working directories not set\n"
+		unless defined $distloc and defined $instloc;
+	die "${fatal}Digest::MD5 unavailable and cannot find working \'md5sum\' "
+	  . "binary\n"
+		unless not $usemd5sum or ( defined $md5sum and -x $md5sum );
+	die "${fatal}Cannot find working \'tar\' binary\n"
+		unless defined $tar and -x $tar;
+	die "${fatal}Cannot find working \'get\' binary\n"
+		unless defined $get and -x $get;
+	die "${fatal}Cannot find working \'sync\' binary\n"
+		unless $useget or ( defined $rsync and -x $rsync );
+
+	print STDERR "${warn}Cannot find working \'pax\' binary - archives with "
+		. "broken paths cannot be repaired\n"
+		unless defined $pax and -x $pax;
+
+	$rsyncargs = join( ' ', $rsyncdefargs, $rsyncargs );
+	$width = undef if $debug;
+
+	if( $updatecheck ) {
+		my $latest = checkforupdate( TRUE );
+		if( defined $latest ) {
+			print "\n" unless $latest eq "";
+		} else {
+			if( defined $site and defined $update ) {
+				print STDERR "${warn}Cannot download version information from\n"
+				    . "        $site/$update\n\n";
+			} else {
+				print STDERR "${warn}Cannot download version information\n";
+			}
+		}
+	}
+
+	my $error;
+	if( defined $useget and not $useget ) {
+		$error = syncdist( $distloc, $instloc, $oldloc );
+	} else {
+		$error = getdist( $distloc, $instloc, $oldloc, $delete );
+
+		if( not ( defined $indexfile or defined $error ) and defined $extra ) {
+			my $oldmirror = $mirror;
+			foreach my $path ( split /\s+/, $extra ) {
+				print STDOUT "\n";
+				if( $path =~ m!^(ht|f)tp://! ) {
+					$mirror = $path;
+#					$path =~ s#^.*/##;
+#					$path =~ s#&.*$##;
+#					$path =~ s#;.*$##;
+#					$path =~ s#\?.*$##; ## Fix vim-syntax mis-highlighting
+					$path =~ s#^.*/([^/&;?]+)([&;?].*)?$#$1#; ## Fix highlights
+				} else {
+					$mirror = $oldmirror;
+					$mirror =~ s#/current(/)?$#/$path#; ## Fix mis-highlighting
+				}
+				$error = getdist( "$distloc/$path"	# Download location
+				                , "$instloc/$path"	# Installation location
+				                , undef				# Destination for old files
+				                , TRUE );			# Delete old files
+			}
+		}
+	}
+
+	if( $launchswmgr and not defined $error ) {
+		my $command;
+		if( defined $ENV{ DISPLAY } and $ENV{ DISPLAY }
+		    and -x "/usr/sbin/SoftwareManager"
+		  ) {
+			$command = "/usr/sbin/SoftwareManager";
+			print STDOUT "Launching SoftwareManager... ";
+		} elsif( -x "/usr/sbin/inst" ) {
+			$command = "/usr/sbin/inst";
+			print STDOUT "Launching inst... ";
+		} else {
+			print STDERR "${fatal}SoftwareManager not present or \$DISPLAY not "
+			           . "set and inst not present\n";
+			$error = TRUE;
+		}
+		if( not defined $error ) {
+			$command .= " -f $instloc";
+			if( defined $extra ) {
+				foreach my $path ( split /\s+/, $extra ) {
+					if( $path =~ m!^(ht|f)tp://! ) {
+						$path =~ s#^.*/([^/&;?]+)([&;?].*)?$#$1#; ##
+					}
+					$command .= " -f $instloc/$path";
+				}
+			}
+			system( $command );
+		}
+	}
+
+	if( defined $error and $error ) {
+		print STDERR "\n$fatal$name encountered an error and aborted:\n";
+		die "\tPlease check the output of \"$name --show\" for configuration "
+		  . "problems\n";
+	} else {
+		print STDOUT "\n$name finished at " . gmtime() . "\n";
+		exit 0;
+	}
+} # main
+
+main();
+1;
+
+# vi: set syntax=perl nowrap ts=4:
